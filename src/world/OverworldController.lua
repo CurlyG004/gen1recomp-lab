@@ -2005,6 +2005,12 @@ function OverworldState:checkBoulderPush(dir)
     self.boulderTried = nil
     return false
   end
+  -- engine/overworld/player_state.asm:357
+  if Collision.pairBlocked(self.map, {}, p.cellX, p.cellY, bx, by)
+      or self.map:cellTile(bx, by) == 0x15 then
+    self.boulderTried = nil
+    return false
+  end
   if Collision.occupied(self.entities, bx, by, npc) then
     self.boulderTried = nil
     return false
