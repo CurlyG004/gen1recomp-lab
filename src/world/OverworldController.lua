@@ -16,6 +16,8 @@ local Logger = require("src.core.Logger")
 local Map = require("src.world.Map")
 local MapLoader = require("src.world.MapLoader")
 local NPC = require("src.world.NPC")
+local AutonomousPause = require("src.world.AutonomousPause")
+local SeamlessPositionContinuity = require("src.world.SeamlessPositionContinuity")
 local PaletteFX = require("src.render.PaletteFX")
 local Pipelines = require("src.render.Pipelines")
 local Player = require("src.world.Player")
@@ -346,6 +348,13 @@ end
 function OverworldState._setGameForTest(g) Game = g end
 
 function OverworldState:exit()
+  SeamlessPositionContinuity.prune(self)
+  self:clearTransitionImpact()
+  require("src.world.OffensiveContact").invalidateWorld(self)
+  for _, npc in pairs(self.npcPool or {}) do
+    AutonomousPause.invalidate(npc)
+    npc:cancelDirectMovement()
+  end
   self.map = nil
   self.neighbors = nil
 end
@@ -429,6 +438,8 @@ function OverworldState:stampClosedDoors()
 end
 
 function OverworldState:setMap(mapId, x, y, facing, opts)
+  self:clearTransitionImpact()
+  require("src.world.OffensiveContact").invalidateWorld(self)
   local fromMapId = self.map and self.map.id
   -- home/overworld.asm:485
   local fromWarp = self.map and self.player
@@ -547,15 +558,23 @@ function OverworldState:setMap(mapId, x, y, facing, opts)
   -- here.  Warps rebuild the whole pool from scratch; a seam crossing arms
   -- the re-seed and applyPendingSpawnResets lands it off camera (#1755).
   if not (opts and opts.seamless and self.npcPool) then
+    SeamlessPositionContinuity.prune(self)
+    for _, npc in pairs(self.npcPool or {}) do
+      AutonomousPause.invalidate(npc)
+      npc:cancelDirectMovement()
+    end
     self.npcPool = {}
   elseif fromMapId ~= mapId then
     for _, obj in ipairs(self.map.def.objects or {}) do
       local npc = self.npcPool[mapId .. "_obj_" .. obj.index]
       if npc then
-        npc.pendingSpawnReset = true
-        -- lets applyPendingSpawnResets skip its whole-pool scan while
-        -- nothing is armed (it runs every frame)
-        self.spawnResetsArmed = true
+        if SeamlessPositionContinuity.active(npc, self) then
+          npc.pendingSpawnReset = nil
+        else
+          npc.pendingSpawnReset = true
+          -- Skip the per-frame pool scan while nothing is armed.
+          self.spawnResetsArmed = true
+        end
       end
     end
   end
@@ -757,6 +776,7 @@ function OverworldState:rebuildNeighbors()
   end
   -- bound resident memory: drop maps behind us that are neither current nor
   -- a drawn neighbor, releasing their window batch / border image / atlas
+  self:prunePresentations()
   MapLoader.trim(keep)
 
   self.preparingLiveMaps = true
@@ -905,12 +925,50 @@ function OverworldState:isNeighborMap(mapId)
   return nil
 end
 
+function OverworldState:prunePresentations()
+  for mapId, objects in pairs(self.presentations or {}) do
+    local live = self.map and self.map.id == mapId or self:isNeighborMap(mapId)
+    if not live then
+      for _, object in ipairs(objects) do object.destroyed = true end
+      self.presentations[mapId] = nil
+    else
+      for index = #objects, 1, -1 do
+        if objects[index].destroyed then table.remove(objects, index) end
+      end
+      if #objects == 0 then self.presentations[mapId] = nil end
+    end
+  end
+end
+
+-- Entries belong to the renderer, never to Capture or to public layer handles.
+function OverworldState:spatialActors()
+  local _, spatial = require("src.render.PresentationEntries").collect(self)
+  return spatial
+end
+
+-- Drop leases on hidden/removed/off-map pooled bodies, but keep exact live
+-- identities through seamless promotion/demotion and deferred spawn resets.
+function OverworldState:pruneAutonomousPauses()
+  local live = {}
+  for _, npc in ipairs(self.npcs or {}) do live[npc] = true end
+  for _, ghost in ipairs(self.ghosts or {}) do live[ghost.npc] = true end
+  for _, npc in pairs(self.npcPool or {}) do
+    if not live[npc] then AutonomousPause.invalidate(npc) end
+  end
+  SeamlessPositionContinuity.prune(self, live)
+end
+
 function OverworldState:rebuildGhosts()
   -- visual-only NPCs on connected maps (survey zoom): same spawn filter
   -- as a real map entry, but they never join self.entities -- no sight
   -- lines, triggers, dialogue or player collision.  Instances are
   -- shared with the real-NPC pool, so positions carry across the seam.
   self.ghosts = {}
+  for _, npc in pairs(self.npcPool or {}) do
+    if npc.mapId ~= self.map.id and not self:isNeighborMap(npc.mapId) then
+      npc:cancelDirectMovement()
+    end
+  end
   for _, nb in ipairs(self.neighbors) do
     local peers = {}
     for _, obj in ipairs(nb.map.def.objects or {}) do
@@ -923,6 +981,7 @@ function OverworldState:rebuildGhosts()
       end
     end
   end
+  OverworldState.pruneAutonomousPauses(self)
 end
 
 -- the deferred half of the seam re-seed armed in setMap (#1755): the cart's
@@ -936,8 +995,12 @@ function OverworldState:applyPendingSpawnResets()
   local due
   for _, npc in pairs(pool) do
     if npc.pendingSpawnReset then
-      due = due or {}
-      due[npc] = true
+      if SeamlessPositionContinuity.active(npc, self) then
+        npc.pendingSpawnReset = nil
+      else
+        due = due or {}
+        due[npc] = true
+      end
     end
   end
   if not due then
@@ -1270,7 +1333,7 @@ end
 
 -- Start a battle behind the into-battle transition: flash, then the
 -- wipe picked by trainer/level/dungeon (GetBattleTransitionID).
-function OverworldState:pushBattle(battle, trainerNpc)
+function OverworldState:pushBattle(battle, trainerNpc, survivorValid, impact)
   local BattleTransition = require("src.render.BattleTransition")
   local lead
   for _, mon in ipairs(Game.save.party) do
@@ -1294,22 +1357,58 @@ function OverworldState:pushBattle(battle, trainerNpc)
   -- function only owns the entry wipe.
   -- engine/battle/battle_transitions.asm:28
   self.battleOamKeep = trainerNpc or false
+  self.battleOamValid = survivorValid
+  self.battleImpact = impact
   self.wipeSpritesFn = function() self:drawWipeSprites() end
   Game.stack:push(BattleTransition.new(Game, function()
+    self:clearTransitionImpact()
     self.battleOamKeep = nil
+    self.battleOamValid = nil
     self.wipeSpritesFn = nil
     Game.stack:push(battle)
   end, {
+    onBlack = function() self:clearTransitionImpact() end,
     trainer = battle.kind == "trainer",
     stronger = lead ~= nil and enemyLevel >= lead.level + 3,
     dungeon = self:isDungeonTransitionMap(),
   }))
 end
 
+function OverworldState:clearTransitionImpact()
+  local freeze = self.battleImpact
+  self.battleImpact = nil
+  if freeze then freeze:release() end
+end
+
+function OverworldState:transitionActor(body)
+  OverworldState.transitionSurvivor(self)
+  local freeze = self.battleImpact
+  if freeze then
+    if body == freeze.body then return freeze.npc end
+    if body == freeze.hero then return freeze.player end
+  end
+  return body
+end
+
+-- A retired lifetime or reconstructed map/body can never revive a survivor.
+function OverworldState:transitionSurvivor()
+  if (self.battleOamValid and not self.battleOamValid())
+      or (self.battleImpact and not self.battleImpact:valid()) then
+    OverworldState.clearTransitionImpact(self)
+    self.battleOamKeep, self.battleOamValid = false, nil
+  end
+  return self.battleOamKeep
+end
+
 -- engine/battle/battle_transitions.asm:28
 function OverworldState:oamCulled(e)
-  if self.battleOamKeep == nil then return OverworldState.spriteOutOfView(self, e) end
-  return e ~= self.player and e ~= self.battleOamKeep
+  local keep = OverworldState.transitionSurvivor(self)
+  if e.isTransitionImpact then
+    local freeze = self.battleImpact
+    return not freeze or (e ~= freeze.npc and e ~= freeze.player)
+  end
+  if keep == nil then return OverworldState.spriteOutOfView(self, e) end
+  return e ~= self.player and e ~= keep
 end
 
 -- engine/overworld/movement.asm:489-509
@@ -1366,7 +1465,7 @@ function OverworldState:drainPendingScripts()
 end
 
 -- Start a background script in one of the bounded parallel slots (09
--- §4.6); overflow waits FIFO-style behind the slots.  rowsOrRef is a row
+-- Â§4.6); overflow waits FIFO-style behind the slots.  rowsOrRef is a row
 -- array or "MAP_ID/name" naming a map_scripts `scripts` entry.
 local PARALLEL_SLOTS = 4
 
@@ -1437,7 +1536,9 @@ function OverworldState:updateParallel()
 end
 
 function OverworldState:update(dt)
+  self:clearTransitionImpact()
   self.battleOamKeep = nil
+  self.battleOamValid = nil
   self.wipeSpritesFn = nil
   -- deferred cutscene launch (see queueScript): run a queued script only
   -- once the triggering warp's transition has finished, its runner has gone
@@ -1677,15 +1778,17 @@ function OverworldState:update(dt)
   end
 
   for _, npc in ipairs(self.npcs) do
-    -- engine/overworld/movement.asm:130
-    if not (npc.wanders and self:spriteOutOfView(npc)) then
-      npc:update(self.map, self.entities)
+    -- Vanilla wanderers keep the official offscreen gate. An exact owned
+    -- continuity lease opts a runtime body into live-map simulation.
+    if not (npc.wanders and self:spriteOutOfView(npc)
+        and not SeamlessPositionContinuity.active(npc, self)) then
+      npc:update(self.map, self.entities, dt)
     end
   end
   require("src.world.PikachuFollower").update(Game, self)
 
   for _, g in ipairs(self.ghosts) do
-    g.npc:update(g.map, g.peers)
+    g.npc:update(g.map, g.peers, dt)
   end
 
   self:updateScriptMoves()
@@ -1725,6 +1828,12 @@ function OverworldState:update(dt)
   if (self.hopLand or 0) > 0 then self.hopLand = self.hopLand - 1 end
 
   local stepped = self.player:update()
+  -- Both actors have progressed. Contact listeners may hand off to Battle;
+  -- do not run native step-completion work beneath a newly pushed state.
+  local physicsTop = Game.stack:top()
+  local physicsMap = self.map
+  require("src.world.OffensiveContact").afterPhysics(self, Game.logicStep)
+  if Game.stack:top() ~= physicsTop or self.map ~= physicsMap then return end
   -- engine/overworld/player_animations.asm:329
   if self.spinArrive and not self.player.spinFrames then
     self.spinArrive = nil
@@ -1824,6 +1933,10 @@ end
 
 function OverworldState:handleInput()
   local input = Game.input
+  if self:hasPlayerControlLock() then
+    self.joyLatch = nil
+    return
+  end
   self.bumpCooldown = math.max(0, (self.bumpCooldown or 0) - 1)
 
   -- OverworldLoop (home/overworld.asm) gates ALL of JoypadOverworld on
@@ -1947,6 +2060,10 @@ end
 -- Keyed weakly on the list itself (a data reload brings a new one) and
 -- rebuilt if its length changes.
 local slopeSets = setmetatable({}, { __mode = "k" })
+
+function OverworldState:hasPlayerControlLock()
+  return next(self.playerControlLocks or {}) ~= nil
+end
 
 function OverworldState:onSlopeMap(mapId)
   local fm = Game.data.field.forcedMovement
@@ -2811,10 +2928,10 @@ function OverworldState:tryBookshelf(fx, fy)
       return true
     end
     Game.stack:push(TextBox.new(Game, t._PokemonBooksText
-      or Strings("Crammed full of\nPOKéMON books!")))
+      or Strings("Crammed full of\nPOKÃ©MON books!")))
   elseif kind == "stuff" then
     Game.stack:push(TextBox.new(Game, t._PokemonStuffText
-      or Strings("There's a slew of\nPOKéMON stuff!")))
+      or Strings("There's a slew of\nPOKÃ©MON stuff!")))
   elseif kind == "elevator" then
     Game.stack:push(TextBox.new(Game, t._ElevatorText
       or Strings("An elevator!")))
@@ -2824,7 +2941,7 @@ function OverworldState:tryBookshelf(fx, fy)
                  or t._IndigoPlateauStatuesText3
     Game.stack:push(TextBox.new(Game,
       (t._IndigoPlateauStatuesText1 or romText(Game.data, "_IndigoPlateauStatuesText1", "INDIGO PLATEAU")) .. "\f"
-      .. (line or Strings("POKéMON LEAGUE HQ"))))
+      .. (line or Strings("POKÃ©MON LEAGUE HQ"))))
   end
   return true
 end
@@ -2986,7 +3103,7 @@ function OverworldState:tryHiddenObject(fx, fy)
   if not extras then return false end
   local facing = self.player.facing
 
-  -- Pokémon Center PCs and other PC tiles
+  -- PokÃ©mon Center PCs and other PC tiles
   for _, h in ipairs(extras.pcTiles[self.map.id] or {}) do
     if h.x == fx and h.y == fy and (not h.facing or h.facing == facing) then
       if self.map.id == "REDS_HOUSE_2F" then
@@ -3039,7 +3156,7 @@ function OverworldState:tryHiddenObject(fx, fy)
       if gym then
         local key = save.inventory[gym.badge] and "_GymStatueText2" or "_GymStatueText1"
         local text = Game.data.text[key]
-                     or Strings("{RAM}\nPOKéMON GYM\nLEADER: {RAM}")
+                     or Strings("{RAM}\nPOKÃ©MON GYM\nLEADER: {RAM}")
         text = text:gsub("{RAM:wGymCityName}", gym.city)
                    :gsub("{RAM:wGymLeaderName}", gym.leader)
         Game.stack:push(TextBox.new(Game, text))
@@ -3312,7 +3429,7 @@ function OverworldState:billsHousePokemonList()
       { stay = { onShown = function() Game.stack:push(menu) end } }))
   end
   Game.stack:push(TextBox.new(Game, t._BillsHousePokemonListText1
-    or Strings("BILL's favorite\nPOKéMON list!"), openList))
+    or Strings("BILL's favorite\nPOKÃ©MON list!"), openList))
 end
 
 -- BillsHouseBillExitsMachineScript: human Bill appears inside the machine
@@ -3658,7 +3775,12 @@ function OverworldState:talkTo(npc)
     Game.save.itemsTaken = Game.save.itemsTaken or {}
     Game.save.itemsTaken[npc.id] = true
     for i, n in ipairs(self.npcs) do
-      if n == npc then table.remove(self.npcs, i) break end
+      if n == npc then
+        AutonomousPause.invalidate(npc)
+        SeamlessPositionContinuity.invalidate(npc)
+        table.remove(self.npcs, i)
+        break
+      end
     end
     for i, e in ipairs(self.entities) do
       if e == npc then table.remove(self.entities, i) break end
@@ -3685,7 +3807,12 @@ function OverworldState:talkTo(npc)
         if result ~= "lose" and result ~= "run" then
           Game.save.defeatedTrainers[npc.id] = true
           for i, n in ipairs(self.npcs) do
-            if n == npc then table.remove(self.npcs, i) break end
+            if n == npc then
+              AutonomousPause.invalidate(npc)
+              SeamlessPositionContinuity.invalidate(npc)
+              table.remove(self.npcs, i)
+              break
+            end
           end
           for i, e in ipairs(self.entities) do
             if e == npc then table.remove(self.entities, i) break end
@@ -3747,7 +3874,7 @@ end
 
 local function sameItems(_, items) return items end
 
--- The Pokémon Center PC: BILL's PC (boxes), the player's item storage,
+-- The PokÃ©mon Center PC: BILL's PC (boxes), the player's item storage,
 -- and PROF.OAK's dex rating (engine/menus/players_pc.asm,
 -- engine/events/pokedex_rating.asm).  The assembled entries run through
 -- the ui.pc.items hook; LOG OFF is appended after it so a mod cannot
@@ -3786,9 +3913,9 @@ function OverworldState:openPC(onDone)
       -- engine/menus/pc.asm:73 BillsPC prints the access text before the farcall
       local accessed = metBill
         and romText(Game.data, "_AccessedBillsPCText",
-          "Accessed BILL's\nPC.\fAccessed POKéMON\nStorage System.")
+          "Accessed BILL's\nPC.\fAccessed POKÃ©MON\nStorage System.")
         or romText(Game.data, "_AccessedSomeonesPCText",
-          "Accessed someone's\nPC.\fAccessed POKéMON\nStorage System.")
+          "Accessed someone's\nPC.\fAccessed POKÃ©MON\nStorage System.")
       Game.stack:push(TextBox.new(Game, accessed, function()
         openSub("BoxMenu")
       end))
@@ -3814,7 +3941,7 @@ function OverworldState:openPC(onDone)
     end,
   })
 
-  -- Prof. Oak's dex rating only appears once you have the Pokédex
+  -- Prof. Oak's dex rating only appears once you have the PokÃ©dex
   if flags.EVENT_GOT_POKEDEX then
     table.insert(items, {
       label = Strings.source("PROF.OAK's PC"),
@@ -3840,7 +3967,7 @@ function OverworldState:openPC(onDone)
           require("src.core.Sound").play(Game.data, "Enter_PC")
           Game.stack:push(TextBox.new(Game,
             romText(Game.data, "_AccessedHoFPCText",
-              "Accessed POKéMON\nLEAGUE's site.\fAccessed the HALL\nOF FAME List."),
+              "Accessed POKÃ©MON\nLEAGUE's site.\fAccessed the HALL\nOF FAME List."),
             function() openSub("LeaguePC") end))
           done()
         end,
@@ -3902,9 +4029,9 @@ function OverworldState:openOaksPC(onDone)
   local done = onDone or function() end
   local text = Game.data.text or {}
   local accessed = text._AccessedOaksPCText
-    or Strings("Accessed PROF.\nOAK's PC.\fAccessed POKéDEX\nRating System.")
+    or Strings("Accessed PROF.\nOAK's PC.\fAccessed POKÃ©DEX\nRating System.")
   local rated = text._GetDexRatedText
-    or Strings("Want to get your\nPOKéDEX rated?")
+    or Strings("Want to get your\nPOKÃ©DEX rated?")
   local closed = text._ClosedOaksPCText
     or Strings("Closed link to\nPROF.OAK's PC.")
   local function close()
@@ -3959,7 +4086,7 @@ function OverworldState:dexRating(onDone)
   end
   local rating = Game.data.text[key] or Strings("Keep it up!")
   local completion = Game.data.text._DexCompletionText
-    or Strings("POKéDEX comp-\nletion is:\f{NUM:hDexRatingNumMonsSeen} POKéMON seen\n{NUM:hDexRatingNumMonsOwned} POKéMON owned\fPROF.OAK's\nRating:")
+    or Strings("POKÃ©DEX comp-\nletion is:\f{NUM:hDexRatingNumMonsSeen} POKÃ©MON seen\n{NUM:hDexRatingNumMonsOwned} POKÃ©MON owned\fPROF.OAK's\nRating:")
   completion = completion
     :gsub("{NUM:hDexRatingNumMonsSeen[^}]*}", tostring(seen))
     :gsub("{NUM:hDexRatingNumMonsOwned[^}]*}", tostring(owned))
@@ -4018,7 +4145,7 @@ end
 -- Nurse dialogue uses the real engine strings (data/text/text_4.asm via
 -- engine/events/pokecenter.asm): welcome (plus "Shall we heal" the first
 -- time), a YES/NO, then the machine animation between "we need your
--- POKéMON" and "fighting fit".
+-- POKÃ©MON" and "fighting fit".
 function OverworldState:nurseHeal(onDone, npc)
   local t = Game.data.text
   if self.map.id == "PEWTER_POKECENTER" and self.pikachuPewterSleepScene then
@@ -4028,11 +4155,11 @@ function OverworldState:nurseHeal(onDone, npc)
   end
   local bye = t._PokemonCenterFarewellText or romText(Game.data, "_PokemonCenterFarewellText", "We hope to see\nyou again!")
   local hello = t._PokemonCenterWelcomeText
-                or Strings("Welcome to our\nPOKéMON CENTER!")
+                or Strings("Welcome to our\nPOKÃ©MON CENTER!")
   if not Game.save.usedPokecenter then
     Game.save.usedPokecenter = true -- BIT_USED_POKECENTER
     hello = hello .. "\f"
-            .. (t._ShallWeHealYourPokemonText or Strings("Shall we heal your\nPOKéMON?"))
+            .. (t._ShallWeHealYourPokemonText or Strings("Shall we heal your\nPOKÃ©MON?"))
   end
   -- Yellow's companion has its own beat threaded through this sequence
   local Follower = require("src.world.PikachuFollower")
@@ -4042,7 +4169,7 @@ function OverworldState:nurseHeal(onDone, npc)
       Game.stack:push(TextBox.new(Game, bye, onDone))
       return
     end
-    local need = t._NeedYourPokemonText or Strings("OK. We'll need\nyour POKéMON.")
+    local need = t._NeedYourPokemonText or Strings("OK. We'll need\nyour POKÃ©MON.")
     -- accepting the heal sends the companion up onto the counter to Nurse
     -- Joy first: pokecenter.asm runs `callfar PikachuWalksToNurseJoy`
     -- between SetLastBlackoutMap and NeedYourPokemonText, and the hop has
@@ -4128,7 +4255,7 @@ end
 -- pokecenter.asm bows the nurse between the two PrintText calls (#995)
 function OverworldState:finishNurseHeal(bye, onDone, npc)
   local t = Game.data.text
-  local fit = t._PokemonFightingFitText or Strings("Your POKéMON are\nfighting fit!")
+  local fit = t._PokemonFightingFitText or Strings("Your POKÃ©MON are\nfighting fit!")
   Game.stack:push(TextBox.new(Game, fit, function()
     local function farewell()
       Game.stack:push(TextBox.new(Game, bye, function()
@@ -4160,7 +4287,7 @@ end
 
 -- The Cable Club link receptionist (TX_SCRIPT_CABLE_CLUB_RECEPTIONIST ->
 -- CableClubNPC, engine/link/cable_club_npc.asm): the welcome line, then
--- without the POKéDEX she's still "making preparations"; with it she asks
+-- without the POKÃ©DEX she's still "making preparations"; with it she asks
 -- to apply (YES/NO), saves the game (SaveGameData + SFX_SAVE) and opens
 -- the link.  The port's enet link menu (src/link/LinkState.lua) stands in
 -- for the original serial handshake; declining prints "Please come again!"
@@ -4723,7 +4850,7 @@ function OverworldState:showMapText(textConst, npc, onDone)
       script(Game, self, npc, onDone or function() end)
       return
     end
-    -- the winning contribution's rows run as their owner (09 §4.4): mod:
+    -- the winning contribution's rows run as their owner (09 Â§4.4): mod:
     -- field routing, strict dispatch and error reports all read the source
     self.runner:run(script, { npc = npc, onDone = onDone,
       checkpointOnDone = finish and "release_npc" or nil,
@@ -4824,7 +4951,7 @@ function OverworldState:applyFieldPoison()
       -- home/text_script.asm:197
       Game.stack:push(TextBox.new(Game,
         romText(Game.data, "_PlayerBlackedOutText",
-          "%s is out of\nuseable POKéMON!\f%s blacked\nout!",
+          "%s is out of\nuseable POKÃ©MON!\f%s blacked\nout!",
           save.player.name, save.player.name), function()
         local Pokemon = require("src.pokemon.Pokemon")
         for _, mon in ipairs(save.party) do Pokemon.heal(mon) end
@@ -4941,7 +5068,7 @@ function OverworldState:onStepComplete()
   -- the Safari game step counter (engine/events/hidden_events/safari_game.asm)
   if self:safariStep() then return end
 
-  -- day-care: the boarded Pokémon gains 1 exp per step (like the original)
+  -- day-care: the boarded PokÃ©mon gains 1 exp per step (like the original)
   if Game.save.daycare and Game.save.daycare.mon then
     Game.save.daycare.steps = (Game.save.daycare.steps or 0)
       + (FieldDefaults.world(Game.data, "daycareExpPerStep") or 1)
@@ -5369,7 +5496,11 @@ function OverworldState:boulderIntoHole(npc)
         end
       end
       for i = #self.npcs, 1, -1 do
-        if self.npcs[i] == npc then table.remove(self.npcs, i) end
+        if self.npcs[i] == npc then
+          AutonomousPause.invalidate(npc)
+          SeamlessPositionContinuity.invalidate(npc)
+          table.remove(self.npcs, i)
+        end
       end
       for i = #self.entities, 1, -1 do
         if self.entities[i] == npc then table.remove(self.entities, i) end
@@ -5380,7 +5511,7 @@ function OverworldState:boulderIntoHole(npc)
   return false
 end
 
--- Safari game step/ball bookkeeping.  502 steps per ¥500 game; running
+-- Safari game step/ball bookkeeping.  502 steps per Â¥500 game; running
 -- out of steps (or balls, checked after battles) ends the game and
 -- returns to the gate (engine/events/hidden_events/safari_game.asm).
 -- The oracle gates on EVENT_IN_SAFARI_ZONE, not the current map (see
@@ -5885,8 +6016,17 @@ function OverworldState:removeRuntimeObject(npcId, owner)
         if owner ~= nil and obj.owner ~= owner then
           return nil, "not owned by " .. tostring(owner)
         end
+        require("src.world.OffensiveContact").invalidateBody(self.npcPool and self.npcPool[npcId])
         table.remove(def.objects, i)
-        if self.npcPool then self.npcPool[npcId] = nil end
+        if self.npcPool then
+          local npc = self.npcPool[npcId]
+          if npc then
+            AutonomousPause.invalidate(npc)
+            SeamlessPositionContinuity.invalidate(npc)
+            npc:cancelDirectMovement()
+          end
+          self.npcPool[npcId] = nil
+        end
         for _, list in ipairs({ self.npcs or {}, self.entities or {} }) do
           for j = #list, 1, -1 do
             if list[j].id == npcId then table.remove(list, j) end
@@ -6142,18 +6282,36 @@ function OverworldState:drawWipeSprites()
       love.graphics.setShader(shader)
     end
     love.graphics.setColor(1, 1, 1, 1)
-    e:draw(cam.x, cam.y)
+    local renderer = Game and Game.renderer
+    if renderer and renderer.wipeTilt then
+      local vw, vh = renderer:worldViewSize()
+      local fx, fy = e.px - cam.x + 8, e.py - cam.y + 16
+      -- The ordinary world pass owns ground shadows. Only replay the upright
+      -- sprite above the screen-space wipe, at the same projected foot.
+      self:billboard(fx, fy, vw, vh, colors, false, e.draw, e, cam.x, cam.y, true)
+    else
+      e:draw(cam.x, cam.y)
+    end
     if shader then love.graphics.setShader() end
   end
   local ok, err = pcall(function()
-    local keep = self.battleOamKeep
+    local keep = OverworldState.transitionSurvivor(self)
+    local freeze = self.battleImpact
+    if freeze then
+      -- Preserve the normal spatial draw order across flash and wipe.
+      local _, spatial = require("src.render.PresentationEntries").collect(self)
+      for _, entry in ipairs(spatial) do
+        if entry.actor == freeze.npc or entry.actor == freeze.player then replay(entry.actor) end
+      end
+      return
+    end
     if keep and keep.draw then
       for _, entity in ipairs(self.entities) do
-        if entity == keep then replay(keep) break end
+        if entity == keep then replay(OverworldState.transitionActor(self, keep)) break end
       end
     end
     if not (self.flyAnim or self.flyArrive or self.playerHidden) then
-      replay(self.player)
+      replay(OverworldState.transitionActor(self, self.player))
     end
   end)
   if ogObp then PaletteFX.setPass(prevPass) end
@@ -6196,7 +6354,7 @@ end
 -- handed (self, cam) so drawWorld does not build six closures per frame;
 -- the pipeline path wraps them for its no-argument ctx.fx contract.
 
--- the Pokémon Center heal machine (PokeCenterOAMData): the monitor
+-- the PokÃ©mon Center heal machine (PokeCenterOAMData): the monitor
 -- tile over the machine's screen and one ball per healed mon in two
 -- mirrored columns, all blinking during the jingle flash.  The GB
 -- draws it at fixed screen coords with the player's cell BG-aligned
@@ -6472,6 +6630,7 @@ end
 -- fishing pose: the rod tile over the faced water (gfx/fishing.asm)
 local function fxRod(self, cam)
   if not self.fishing then return end
+  if self.player:hasAppearanceOverride() then return end
   -- engine/overworld/player_animations.asm:424
   if self.fishing.hideRod then return end
   local fx = Game.data.field.overworldFx
@@ -6529,6 +6688,9 @@ end
 
 -- engine/overworld/movement.asm:90
 local function grassStrip(self, e)
+  -- Altitude is visual only: never lift a ground-terrain strip into the air.
+  -- Vanilla actors keep the official zero-elevation feet-strip path.
+  if (e.visualElevation or 0) ~= 0 then return nil end
   local map = self.map
   local test = map.isGrassCell
   if e ~= self.player and GameVersion.generation() == 1 and map.isNpcGrassCell then
@@ -6556,7 +6718,21 @@ local function queueGrass(self, q, e)
   end
   n = n + 1
   qx0[n], qy0[n], qx1[n], qy1[n] = x0, y0, x1, y1
+  q.maps[n], q.ox[n], q.oy[n] = self.map, 0, 0
+  q.cellX[n], q.cellY[n] = nil, nil
   q.n = n
+end
+
+local function queuePresentationGrass(self, q, cx, cy, entry)
+  local map = entry.terrainMap or self.map
+  if cx == nil or cy == nil or not map:isGrassCell(cx, cy) then return end
+  for i = 1, q.n do
+    if q.cellX[i] == cx and q.cellY[i] == cy and q.maps[i] == map then return end
+  end
+  local n = q.n + 1
+  q.cellX[n], q.cellY[n] = cx, cy
+  q.x0[n], q.y0[n], q.x1[n], q.y1[n] = nil, nil, nil, nil
+  q.maps[n], q.ox[n], q.oy[n], q.n = map, entry.ox, entry.oy, n
 end
 
 -- Is a neighbour map's ghost NPC wholly outside the vw x vh view?  The
@@ -6570,12 +6746,43 @@ local function ghostOffscreen(g, camX, camY, vw, vh)
   if not (sprite and sprite.getScreenOrigin and vw and vh) then
     return false
   end
-  local sx, sy = sprite:getScreenOrigin(npc.px, npc.py, camX, camY)
+  local sx, sy = sprite:getScreenOrigin(npc.px,
+    npc.py - (npc.visualElevation or 0) * 16, camX, camY)
   local fw = sprite.frameWidth or 16
   local fh = sprite.frameHeight or 16
+  if npc.shadowImg and (npc.groundShadow or npc.hopShadowY) then
+    local x, y, w, h = require("src.render.GroundShadow").bounds(npc.px,
+      npc.hopShadowY or npc.py, camX, camY,
+      npc.groundShadowOffsetX, npc.groundShadowOffsetY)
+    local right, bottom = math.max(sx + fw, x + w), math.max(sy + fh, y + h)
+    sx, sy = math.min(sx, x), math.min(sy, y)
+    fw, fh = right - sx, bottom - sy
+  end
   local pad = GHOST_CULL_PAD
   return sx + fw + pad < 0 or sy + fh + pad < 0
       or sx - pad > vw or sy - pad > vh
+end
+
+local PresentationEntries = require("src.render.PresentationEntries")
+
+local function drawEntry(entry, camX, camY, shadowDrawn)
+  local actor = entry.actor
+  if entry.layer then
+    actor:drawLayer(entry.layer, camX - entry.ox, camY - entry.oy)
+  else
+    actor:draw(camX - entry.ox, camY - entry.oy, shadowDrawn)
+  end
+end
+
+local function entryVisible(self, entry, cam, vw, vh)
+  local actor = entry.actor
+  if entry.neighbor and self.battleOamKeep ~= nil then return false end
+  if actor == self.player and (self.flyAnim or self.flyArrive or self.playerHidden) then
+    return false
+  end
+  if not Tilt.active() and entry.ghost and ghostOffscreen(entry.ghost,
+      cam.x - entry.ox, cam.y - entry.oy, vw, vh) then return false end
+  return not self:oamCulled(actor)
 end
 
 function OverworldState:drawWorld()
@@ -6817,37 +7024,56 @@ function OverworldState:drawWorld()
     local boulderDust = self.dustAnim and self.dustAnim.boulder
     local grass = self.grassStripScratch
     if not grass then
-      grass = { n = 0, x0 = {}, y0 = {}, x1 = {}, y1 = {} }
+      grass = { n = 0, x0 = {}, y0 = {}, x1 = {}, y1 = {}, maps = {}, ox = {}, oy = {}, cellX = {}, cellY = {} }
       self.grassStripScratch = grass
     end
+    for i = 1, grass.n do grass.maps[i] = nil end
     grass.n = 0
     if boulderDust then fxDust(self, cam) end
-    for _, g in ipairs(self.ghosts) do
-      if self.battleOamKeep == nil then
-        local gx, gy = cam.x - g.ox, cam.y - g.oy
-        if not ghostOffscreen(g, gx, gy, vw, vh) then
-          g.npc:draw(gx, gy)
+    local before, spatial, after = PresentationEntries.collect(self)
+    local shadows = PresentationEntries.shadows(self, before, spatial, after, cam.x, cam.y,
+      function(entry) return entryVisible(self, entry, cam, vw, vh) end)
+    local function drawFlat(entries, grassQueue)
+      for _, entry in ipairs(entries) do
+        if entryVisible(self, entry, cam, vw, vh) then
+          drawEntry(entry, cam.x, cam.y, shadows[entry.actor])
+          if grassQueue then
+            if entry.activeEntity then
+              queueGrass(self, grass, entry.actor)
+            else
+              PresentationEntries.eachTerrainCell(entry, function(cx, cy)
+                queuePresentationGrass(self, grass, cx, cy, entry)
+              end)
+            end
+          end
         end
       end
     end
-    for _, e in ipairs(self.entities) do
-      if not ((self.flyAnim or self.flyArrive or self.playerHidden)
-              and e == self.player) and not self:oamCulled(e) then
-        e:draw(cam.x, cam.y)
-        queueGrass(self, grass, e)
-      end
-    end
+    drawFlat(before)
+    drawFlat(spatial, true)
     love.graphics.setColor(1, 1, 1, 1)
     local shake = bgY - cam.y
     for i = 1, grass.n do
-      local x0, y0 = grass.x0[i], grass.y0[i] + shake
-      local x1, y1 = grass.x1[i], grass.y1[i] + shake
-      self.map.renderer:drawStrip(x0, y0, x1, y1, cam.x, bgY)
+      local map = grass.maps[i]
+      local gx, gy = cam.x - grass.ox[i], bgY - grass.oy[i]
+      local x0, y0 = grass.x0[i], grass.y0[i] and grass.y0[i] + shake
+      local x1, y1 = grass.x1[i], grass.y1[i] and grass.y1[i] + shake
+      if grass.cellX[i] then
+        map.renderer:drawCellBottom(grass.cellX[i], grass.cellY[i], gx, gy)
+      else
+        map.renderer:drawStrip(x0, y0, x1, y1, gx, gy)
+      end
       if grassColors then
-        self.map.renderer:markStripRedraw(x0, y0, x1, y1,
-                                          cam.x, bgY, grassColors)
+        local colors = map == self.map and grassColors
+          or PaletteFX.pal(Game.data, self:paletteNameFor(map))
+        if grass.cellX[i] then
+          map.renderer:markCellBottomRedraw(grass.cellX[i], grass.cellY[i], gx, gy, colors)
+        else
+          map.renderer:markStripRedraw(x0, y0, x1, y1, gx, gy, colors)
+        end
       end
     end
+    drawFlat(after)
     fxHeal(self, cam)
     if not boulderDust then fxDust(self, cam) end
     fxCutTree(self, cam)
@@ -6857,7 +7083,7 @@ function OverworldState:drawWorld()
   else
     -- === TILT PATH: ground-hugging FX stay on the projected ground, all
     -- standing things billboard upright over it in a separate pass. ======
-    -- Dust / cut / the Poké Center heal overlay hug the BG (the heal
+    -- Dust / cut / the PokÃ© Center heal overlay hug the BG (the heal
     -- machine is a tileset graphic; its OAM balls must ride that plane or
     -- they float off the machine once the ground foreshortens).  Flat mode
     -- draws them last, over the sprites, in the same canvas; here the two
@@ -6867,57 +7093,46 @@ function OverworldState:drawWorld()
     fxDust(self, cam)
     fxCutTree(self, cam)
 
+    local before, spatial, after = PresentationEntries.collect(self)
+    local shadows = PresentationEntries.shadows(self, before, spatial, after, cam.x, cam.y,
+      function(entry) return entryVisible(self, entry, cam, vw, vh) end)
     Game.renderer:beginUprightPass()
-
-    -- One y-sorted list of ALL upright billboards -- sprites (player, NPCs,
-    -- ghosts) -- keyed on baseline world y (the foot / base row).  Farther
-    -- rows project higher/smaller, so back-to-front is just ascending
-    -- baseline y.
-    local items = {}
-    for _, g in ipairs(self.ghosts) do
-      if self.battleOamKeep == nil then
-        items[#items + 1] = { y = g.npc.py + g.oy + 16, kind = "ghost", g = g }
-      end
-    end
-    for _, e in ipairs(self.entities) do
-      if not ((self.flyAnim or self.flyArrive or self.playerHidden)
-              and e == self.player) and not self:oamCulled(e) then
-        items[#items + 1] = { y = e.py + 16, kind = "entity", e = e }
-      end
-    end
-    table.sort(items, function(a, b) return a.y < b.y end)
-
-    for _, it in ipairs(items) do
-      if it.kind == "ghost" then
-        -- ghosts billboard just like real entities (foot offset folds in the
-        -- neighbour map's ox/oy that ghost draws already apply via the camera)
-        local g = it.g
-        local fx = g.npc.px - cam.x + g.ox + 8
-        local fy = g.npc.py - cam.y + g.oy + 16
-        self:billboard(fx, fy, vw, vh, zoneColorsAt(zones, fx, fy), false,
-                       function() g.npc:draw(cam.x - g.ox, cam.y - g.oy) end)
-      else
-        local e = it.e
-        local fx = e.px - cam.x + 8
-        local fy = e.py - cam.y + 16
-        local colors = zoneColorsAt(zones, fx, fy)
-        self:billboard(fx, fy, vw, vh, colors, false,
-                       function() e:draw(cam.x, cam.y) end)
-        -- tall-grass feet overdraw glued to the sprite: same anchor + depth
-        -- so it keeps hiding the feet, color-0-keyed palette so its white
-        -- gaps still show the sprite through (drawStripRaw lets the
-        -- billboard own the shader; bgY keeps the elevator-shake offset).
-        local x0, y0, x1, y1 = grassStrip(self, e)
-        if x0 then
-          local shake = bgY - cam.y
-          self:billboard(fx, fy, vw, vh, colors, true, function()
-            love.graphics.setColor(1, 1, 1, 1)
-            self.map.renderer:drawStripRaw(x0, y0 + shake, x1, y1 + shake,
-                                           cam.x, bgY)
-          end)
+    local function drawUpright(entries, overdraw)
+      for _, entry in ipairs(entries) do
+        if entryVisible(self, entry, cam, vw, vh) then
+          local actor, ox, oy = entry.actor, entry.ox, entry.oy
+          local fx, fy = actor.px - cam.x + ox + 8, actor.py - cam.y + oy + 16
+          local colors = zoneColorsAt(zones, fx, fy)
+          self:billboard(fx, fy, vw, vh, colors, false,
+            drawEntry, entry, cam.x, cam.y, shadows[actor])
+          if overdraw then
+            local map = entry.terrainMap or self.map
+            if entry.activeEntity then
+              local x0, y0, x1, y1 = grassStrip(self, actor)
+              if x0 then
+                local shake = bgY - cam.y
+                self:billboard(fx, fy, vw, vh, colors, true, function()
+                  love.graphics.setColor(1, 1, 1, 1)
+                  map.renderer:drawStripRaw(x0, y0 + shake, x1, y1 + shake, cam.x, bgY)
+                end)
+              end
+            else
+            PresentationEntries.eachTerrainCell(entry, function(cx, cy)
+              if cx ~= nil and cy ~= nil and map:isGrassCell(cx, cy) then
+                self:billboard(fx, fy, vw, vh, colors, true, function()
+                  love.graphics.setColor(1, 1, 1, 1)
+                  map.renderer:drawCellBottomRaw(cx, cy, cam.x - ox, bgY - oy)
+                end)
+              end
+            end)
+            end
+          end
         end
       end
     end
+    drawUpright(before)
+    drawUpright(spatial, true)
+    drawUpright(after)
 
     -- Standing world FX: each billboards at the ground foot of the
     -- character it belongs to, so it stays upright over the tilted ground.

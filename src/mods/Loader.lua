@@ -1359,6 +1359,29 @@ local GB_BUTTONS = {
   a = true, b = true, start = true, select = true,
 }
 
+-- No existing generic resource journal: input, Net and Job have separate ledgers.
+-- This owner scope is independent of saves and of the current Game.mods pointer.
+function Loader:resourceOwner(modId)
+  self.resourceOwners = self.resourceOwners or {}
+  local owner = self.resourceOwners[modId]
+  if not owner then
+    owner = require("src.mods.ResourceOwner").new(modId)
+    if self.resourcesRetired then owner:releaseAll() end
+    self.resourceOwners[modId] = owner
+  end
+  return owner
+end
+
+function Loader:releaseModResources(modId)
+  local owners = self.resourceOwners or {}
+  if modId ~= nil then
+    self:resourceOwner(modId):releaseAll()
+  else
+    self.resourcesRetired = true
+    for _, owner in pairs(owners) do owner:releaseAll() end
+  end
+end
+
 -- per-mod mod.input ledger (#807): seq numbers this mod's Input sources,
 -- tokens maps each opaque press token to what release must undo.  Living
 -- on the loader (not the api closure) is what lets rollback, hot reload
@@ -1793,7 +1816,7 @@ function Loader:_api(mod)
   -- mod.world materializes on first touch, like the image helper above: a
   -- headless load must not drag the world stack in, and the Game the facade
   -- acts on is still being wired when the entry chunk runs
-  local world, battle
+  local world, battle, audio, pokemon, creature, bag
   setmetatable(api, { __index = function(_, key)
     -- mod.game is the live service owner, resolved per generation the way
     -- mod.world is: src/core/Game.lua's singleton under Gen 1, the Game2
@@ -1803,6 +1826,38 @@ function Loader:_api(mod)
     -- src.core.Game, which under Gold hands back a table nothing instantiated.
     if key == "game" then return loader:_game() end
     local game = loader:_game()
+    if key == "bag" then
+      if not bag then
+        local module = engineRequire("src.mods.BagAPI")
+        bag = module.new(function() return loader:_game() end,
+          function() return loader.generation end)
+      end
+      return bag
+    end
+    if key == "creature" then
+      if not creature then
+        local module = engineRequire("src.mods.CreatureAPI")
+        creature = module.new(function() return loader:_game() end,
+          function() return loader.generation end)
+      end
+      return creature
+    end
+    if key == "pokemon" then
+      if not pokemon then
+        local module = engineRequire("src.mods.PokemonAPI")
+        pokemon = module.new(function() return loader:_game() end,
+          function() return loader.generation end)
+      end
+      return pokemon
+    end
+    if key == "audio" then
+      if not audio then
+        local module = engineRequire("src.mods.AudioAPI")
+        audio = module.new(function() return loader:_game() end,
+          function() return loader.generation end)
+      end
+      return audio
+    end
     if key == "battle" then
       if battle then return battle end
       local module = game and engineRequire(Loader.apiModule(
@@ -1819,7 +1874,7 @@ function Loader:_api(mod)
     local module = game and engineRequire(Loader.apiModule(
       "world", loader.generation, loader.version))
     if not module then return nil end
-    world = module.new(game, modId)
+    world = module.new(game, modId, loader:resourceOwner(modId))
     return world
   end })
   return api
@@ -1894,6 +1949,7 @@ function Loader:_rollback(modId)
   self.events:removeOwner(modId)
   self.hooks:removeOwner(modId)
   self:releaseModInput(modId)
+  self:releaseModResources(modId)
   self.exports[modId] = nil
   self.optionSchemas[modId] = nil
   self.migrations[modId] = nil

@@ -21,7 +21,9 @@ function Collision.occupied(entities, cx, cy, ignore)
   for _, e in ipairs(entities) do
     if e ~= ignore and not e.passable then
       if (e.cellX == cx and e.cellY == cy) or
-         (e.targetX == cx and e.targetY == cy) then
+         (e.targetX == cx and e.targetY == cy) or
+         (e.offensiveContact and e.offensiveContact.destination.x == cx
+           and e.offensiveContact.destination.y == cy) then
         return e
       end
     end
@@ -54,7 +56,7 @@ local function pairBlocked(map, mover, sx, sy, tx, ty)
 end
 Collision.pairBlocked = pairBlocked
 
-local function verdict(map, entities, mover, dir, tx, ty)
+local function verdict(map, entities, mover, dir, tx, ty, ignoredPlayer, sx, sy)
   if not map:inBounds(tx, ty) then
     return false, "bounds"
   end
@@ -64,11 +66,21 @@ local function verdict(map, entities, mover, dir, tx, ty)
       return false, "tile"
     end
   end
-  if pairBlocked(map, mover, mover.cellX, mover.cellY, tx, ty) then
+  if pairBlocked(map, mover, sx or mover.cellX, sy or mover.cellY, tx, ty) then
     return false, "tile"
   end
-  if Collision.occupied(entities, tx, ty, mover) then
-    return false, "entity"
+  if not ignoredPlayer then
+    if Collision.occupied(entities, tx, ty, mover) then return false, "entity" end
+  else
+    for _, entity in ipairs(entities) do
+      if entity ~= mover and entity ~= ignoredPlayer and not entity.passable
+          and ((entity.cellX == tx and entity.cellY == ty)
+            or (entity.targetX == tx and entity.targetY == ty)
+            or (entity.offensiveContact and entity.offensiveContact.destination.x == tx
+              and entity.offensiveContact.destination.y == ty)) then
+        return false, "entity"
+      end
+    end
   end
   return true
 end
@@ -94,6 +106,38 @@ function Collision.canMove(map, entities, mover, dir)
   end
   if allowed then return true end
   return false, why
+end
+
+-- Read-only native NPC navigation from a hypothetical source cell. No
+-- movement.collision middleware: hooks can mutate state or override constraints.
+-- Warp exclusion matches NPC ROAM; neither existing movement path is changed.
+function Collision.queryMove(map, entities, mover, dir, sx, sy)
+  local tx, ty = Collision.target(sx, sy, dir)
+  if not map:inBounds(sx, sy) or not map:inBounds(tx, ty) then
+    return false, "bounds"
+  end
+  if map:warpAtCell(tx, ty) then return false, "warp" end
+  return verdict(map, entities, mover, dir, tx, ty, nil, sx, sy)
+end
+
+-- Engine-only scoped validation: never turn an entity refusal into success.
+-- Hard constraints remain authoritative even when middleware overrides them.
+function Collision.canMoveTowardPlayer(map, entities, mover, dir, player, sx, sy)
+  sx, sy = sx or mover.cellX, sy or mover.cellY
+  local tx, ty = Collision.target(sx, sy, dir)
+  local allowed, why = verdict(map, entities, mover, dir, tx, ty, player, sx, sy)
+  if map:warpAtCell(tx, ty) then allowed, why = false, "warp" end
+  if Runtime.wantsHook("movement.collision") then
+    local ctx = {map=map, mover=mover, dir=dir, fromX=sx,
+      fromY=sy, toX=tx, toY=ty, reason=why, offensive=true}
+    local hooked = Runtime.call("movement.collision", passthrough, allowed, ctx)
+    if not allowed then return false, why end
+    if not hooked then return false, ctx.reason or "hook" end
+  end
+  if not allowed then return false, why end
+  allowed, why = verdict(map, entities, mover, dir, tx, ty, player, sx, sy)
+  if map:warpAtCell(tx, ty) then return false, "warp" end
+  return allowed, why
 end
 
 return Collision

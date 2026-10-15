@@ -6,6 +6,7 @@
 
 local Assets = require("src.render.Assets")
 local GbcPalette = require("src.render.GbcPalette")
+local GameVersion = require("src.core.GameVersion")
 local PaletteFX = require("src.render.PaletteFX")
 
 local SpriteRenderer = {}
@@ -315,6 +316,19 @@ function SpriteRenderer:setObjPalette(colors, group)
   self.objGroup = group or "gen2"
 end
 
+-- Gen 1 mod NPC override. Kept apart from objColors to preserve the shared
+-- Gen 2/GBA caller-owned palette contract and precedence.
+function SpriteRenderer:setGen1ObjPaletteOverride(colors, group)
+  self.gen1ObjColors = colors
+  self.gen1ObjGroup = group
+end
+
+local function gen1ObjOverride(self)
+  if GameVersion.generation() == 1 and PaletteFX.usesGbcPack() then
+    return self.gen1ObjColors, self.gen1ObjGroup
+  end
+end
+
 -- The Gen 2 OBJ palette with the COLOR option applied.  Resolved on the way
 -- to the bake rather than where the world hands the colours over: the option
 -- can change between two frames of a standing map, and applyPalettes only
@@ -332,6 +346,8 @@ end
 
 function SpriteRenderer:resolveImage()
   if liveTrueColor(self.def) then return self.image end
+  local colors, group = gen1ObjOverride(self)
+  if colors then return getObpImage(self.def.image, colors, group) end
   if self.objColors then
     return getObpImage(self.def.image, self:gen2Obp())
   end
@@ -433,10 +449,13 @@ function SpriteRenderer:draw(px, py, camX, camY, facing, walkPhase, stepFlip,
     topHalf, forceFlip, frameOverride, oamRow)
   local image = self.image
   local redraw = false
+  local gen1Colors, gen1Group = gen1ObjOverride(self)
   -- True-color sheets bypass every palette bake; the screen-space exemption
   -- is recorded below once the final frame/height is known.
   if liveTrueColor(self.def) then
     image = self.image
+  elseif gen1Colors then
+    image = getObpImage(self.def.image, gen1Colors, gen1Group)
   elseif self.objColors then
     -- Gen 2: the palette came from the caller (setObjPalette).  Like RED++
     -- this bakes to a true-color, real-alpha image and there is no BG zone
@@ -541,8 +560,11 @@ end
 -- raw DMG shades (#384).
 function SpriteRenderer:drawTile(path, x, y, flip, quad)
   local image, redraw = getImage(path), false
+  local gen1Colors, gen1Group = gen1ObjOverride(self)
   if liveTrueColor(self.def) then
     PaletteFX.markTrueColor(x, y, 16, 8)
+  elseif gen1Colors then
+    image = getObpImage(path, gen1Colors, gen1Group)
   elseif self.objColors then
     image = getObpImage(path, self:gen2Obp())
   elseif PaletteFX.usesGbcPack() then

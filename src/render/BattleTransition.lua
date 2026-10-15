@@ -321,6 +321,7 @@ function BattleTransition.new(game, onDone, opts)
   end
   self.style = style
   self.def = def
+  self.onBlack = opts.onBlack
   -- only the circle wipes flash first (battle_transitions.asm:585,628)
   self.phase = def.flash and "flash" or "wipe"
   self.wipeLen = def.frames
@@ -328,7 +329,15 @@ function BattleTransition.new(game, onDone, opts)
   return self
 end
 
+function BattleTransition:exit()
+  self.cancelled = true
+  if self.onBlack then self.onBlack(); self.onBlack = nil end
+  self.onDone = nil
+end
+
 function BattleTransition:update(dt)
+  if self.cancelled then return end
+  if self.game.stack.top and self.game.stack:top() ~= self then self:exit(); return end
   self.t = self.t + 1
   if self.phase == "flash" then
     if self.t >= FLASH_CYCLES * #FLASH_STEPS * FLASH_HOLD then
@@ -336,9 +345,14 @@ function BattleTransition:update(dt)
       self.t = 0
     end
   else
+    if self.t >= self.wipeLen and self.onBlack then
+      self.onBlack(); self.onBlack = nil
+    end
     if self.t >= self.wipeLen + self.hold then
+      local done = self.onDone
+      self.onDone = nil
       self.game.stack:pop()
-      if self.onDone then self.onDone() end
+      if done then done() end
     end
   end
 end

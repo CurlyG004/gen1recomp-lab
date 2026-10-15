@@ -35,18 +35,21 @@ function HotReload.run(game, opts)
   -- loader being torn down; retire them while its subscribers still
   -- exist, or the fresh loader inherits phantom "mod:*" sources and
   -- pointers nobody left alive can release (#807)
+  if game.mods and game.mods.releaseModResources then game.mods:releaseModResources() end
   if game.mods and game.mods.releaseModInput then game.mods:releaseModInput() end
   if game.cancelPointers then game:cancelPointers() end
   local loader = Loader.new(opts and { fs = opts.fs, dev = opts.dev } or nil)
   loader.game = game
   -- mod.save keeps pointing at the live slot across the reload
   if game.save and game.save.modData then loader.modSave = game.save.modData end
+  -- Entry chunks can materialize mod.world while load is running. Publish
+  -- this Loader first so the facade and its ResourceOwner share a lifetime.
+  game.mods = loader
   local ok, err = pcall(loader.load, loader, data)
   if not ok then
     loader.errors[#loader.errors + 1] = tostring(err)
     Logger.error("hot reload: %s", tostring(err))
   end
-  game.mods = loader
   game.modStatus = loader:status()
   -- the one invalidation entry point: every downstream cache registered
   -- against Assets empties here (maps, tiles, sprites, pics, font, screens)

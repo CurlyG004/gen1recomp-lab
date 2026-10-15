@@ -12,6 +12,7 @@
 -- battle dispatches on serves these same objects.
 
 local Damage = require("src.battle.Damage")
+local EndCause = require("src.battle.EndCause")
 local Logger = require("src.core.Logger")
 local Status = require("src.battle.Status")
 local StatusRegistry = require("src.battle.StatusRegistry")
@@ -779,7 +780,13 @@ MoveEffects.full = {
           else
             ctx.say(romText(ctx.battle.data, "_RanFromBattleText", "%s\nran from battle!", displayName(user)))
           end
-          battle.result = "run"
+          local cause = ({ TELEPORT = "TELEPORT", ROAR = "ROAR", WHIRLWIND = "WHIRLWIND" })[move.id]
+          if cause then
+            EndCause.set(battle, "run", cause)
+          else
+            -- Extensions may reuse this effect with an unknown move ID.
+            battle.result, battle.endCause, battle._endCauseResult = "run", "UNKNOWN", nil
+          end
           battle.afterQueue = "finish"
         elseif move.id == "TELEPORT" then
           battle:cancelMoveAnim()

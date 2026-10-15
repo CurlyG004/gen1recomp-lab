@@ -1,3 +1,4 @@
+local EndCause = require("src.battle.EndCause")
 -- Link battles over the peer-to-peer link (src/link/Net.lua),
 -- lockstep-simulated like the real link cable: BOTH sides run the
 -- full battle engine (BattleState) locally
@@ -295,9 +296,9 @@ function LinkBattle.new(game, net, opts)
 
   local send = function(msg) net:send(msg) end
 
-  local function endAsDraw(s, text)
+  local function endAsDraw(s, text, cause)
     if s.linkEnded then return end
-    s.result = "draw"
+    EndCause.set(s, "draw", cause)
     s.afterQueue = "finish"
     s.phase = "messages"
     if text then s:say(text) end
@@ -306,9 +307,9 @@ function LinkBattle.new(game, net, opts)
   -- a tournament shot clock (opts.turnLimit) costs the slow player
   -- specifically, unlike RUN or a desync -- both of which stay a draw --
   -- so it needs its own result rather than reusing endAsDraw
-  local function endWithResult(s, result, text)
+  local function endWithResult(s, result, text, cause)
     if s.linkEnded then return end
-    s.result = result
+    EndCause.set(s, result, cause)
     s.afterQueue = "finish"
     s.phase = "messages"
     if text then s:say(text) end
@@ -441,7 +442,7 @@ function LinkBattle.new(game, net, opts)
                                   fatal = true })
     endAsDraw(s, Strings(
       "Link desync!\n%s differs.\fAre both games\nthe same version\nand mods?",
-      component))
+      component), "LINK_DESYNC")
   end
 
   -- a non-fatal component split: both sides log it and carry on, so the
@@ -488,14 +489,14 @@ function LinkBattle.new(game, net, opts)
     if myMsg.kind == "run" then
       -- engine/battle/core.asm:1598
       local both = theirMsg.kind == "run"
-      endWithResult(s, (both or not opts.cable) and "draw" or "lose")
+      endWithResult(s, (both or not opts.cable) and "draw" or "lose", nil, "LINK_RUN")
       s:act(function() require("src.core.Sound").play(s.data, "Run") end)
       s:say(s:romText("_GotAwayText", nil))
       return
     end
     if theirMsg.kind == "run" then
       -- engine/battle/core.asm:254
-      endWithResult(s, opts.cable and "win" or "draw")
+      endWithResult(s, opts.cable and "win" or "draw", nil, "LINK_RUN")
       s:say(s:romText("_EnemyRanText", nil, s.enemy.name))
       s:act(function()
         require("src.core.Sound").play(s.data, "Run")
@@ -733,7 +734,7 @@ function LinkBattle.new(game, net, opts)
     -- engine/battle/core.asm:1157
     s:sayNext(RomText(game.data, "_LinkBattleLostText", nil,
       game.save.player.name, theirName))
-    s.result = "lose"
+    EndCause.set(s, "lose", "LINK_PLAYER_DEFEATED")
     s.afterQueue = "finish"
   end
 
@@ -747,7 +748,7 @@ function LinkBattle.new(game, net, opts)
     -- engine/battle/core.asm:934
     s:sayNext(RomText(game.data, "_TrainerDefeatedText", nil,
       game.save.player.name, theirName))
-    s.result = "win"
+    EndCause.set(s, "win", "LINK_OPPONENT_DEFEATED")
     s.afterQueue = "finish"
   end
 
@@ -773,7 +774,7 @@ function LinkBattle.new(game, net, opts)
         -- the peer's own shot clock ran out; unlike a mutual RUN/desync
         -- draw, this has a definite winner (us)
         if not s.result then
-          endWithResult(s, "win", Strings("%s ran out of\ntime!", theirName))
+          endWithResult(s, "win", Strings("%s ran out of\ntime!", theirName), "LINK_OPPONENT_FORFEITED")
         end
       else
         -- a tournament control message (bracket_update, the next
@@ -787,10 +788,10 @@ function LinkBattle.new(game, net, opts)
     local turnPlaying = s.phase == "messages" and s.afterQueue == "linkNext"
     if s.peerLeft and not s.result and not turnPlaying then
       s.peerLeft = nil
-      endAsDraw(s, Strings("%s left the\nbattle.", theirName))
+      endAsDraw(s, Strings("%s left the\nbattle.", theirName), "LINK_DISCONNECTED")
     end
     if net.closed and not s.linkEnded and not s.result and not turnPlaying then
-      endAsDraw(s)
+      endAsDraw(s, nil, "LINK_DISCONNECTED")
     end
     -- Both early returns below skip baseUpdate, which is where the
     -- presentational clock normally advances -- so tick it here, in the same
@@ -820,7 +821,7 @@ function LinkBattle.new(game, net, opts)
       if s.turnClock <= 0 then
         s.turnClockActive = false
         send({ type = "forfeit" })
-        endWithResult(s, "lose", Strings("Time's up! You\nforfeit the match."))
+        endWithResult(s, "lose", Strings("Time's up! You\nforfeit the match."), "LINK_PLAYER_FORFEITED")
       end
     elseif opts.turnLimit then
       s.turnClockActive = false
@@ -932,9 +933,9 @@ function LinkBattle.newSpectator(game, net, opts)
     return nil
   end
 
-  local function endSpectate(s, text)
+  local function endSpectate(s, text, cause)
     if s.linkEnded then return end
-    s.result = s.result or "ended"
+    if not s.result then EndCause.set(s, "ended", cause) end
     s.afterQueue = "finish"
     s.phase = "messages"
     if text then s:say(text) end
@@ -1005,7 +1006,7 @@ function LinkBattle.newSpectator(game, net, opts)
 
   local function resolveSpecTurn(s, hostMsg, guestMsg)
     if hostMsg.kind == "run" or guestMsg.kind == "run" then
-      endSpectate(s, "The match ended.")
+      endSpectate(s, "The match ended.", "LINK_SPECTATOR_RUN")
       return
     end
     s.phase = "messages"
@@ -1106,7 +1107,7 @@ function LinkBattle.newSpectator(game, net, opts)
       end
     end
     s:sayNext(Strings("%s is out of\nPOKéMON!\f%s wins!", hostName, guestName))
-    s.result = "guestWin"
+    EndCause.set(s, "guestWin", "LINK_HOST_DEFEATED")
     s.afterQueue = "finish"
   end
 
@@ -1118,7 +1119,7 @@ function LinkBattle.newSpectator(game, net, opts)
       end
     end
     s:sayNext(Strings("%s is out of\nPOKéMON!\f%s wins!", guestName, hostName))
-    s.result = "hostWin"
+    EndCause.set(s, "hostWin", "LINK_GUEST_DEFEATED")
     s.afterQueue = "finish"
   end
 
@@ -1145,7 +1146,10 @@ function LinkBattle.newSpectator(game, net, opts)
             table.insert(s.guestReplace, math.max(1, math.min(#guestParty, idx)))
           end
         elseif inner.type == "bye" or inner.type == "forfeit" then
-          if not s.result then endSpectate(s, "The match ended.") end
+          if not s.result then
+            endSpectate(s, "The match ended.", inner.type == "forfeit"
+              and "LINK_SPECTATOR_FORFEITED" or "LINK_SPECTATOR_DISCONNECTED")
+          end
         elseif inner.type == "hello" or inner.type == "party" then
           s.pendingTournamentMessages = s.pendingTournamentMessages or {}
           table.insert(s.pendingTournamentMessages, msg)
@@ -1159,7 +1163,7 @@ function LinkBattle.newSpectator(game, net, opts)
       end
     end
     if net.closed and not s.linkEnded and not s.result then
-      endSpectate(s)
+      endSpectate(s, nil, "LINK_SPECTATOR_DISCONNECTED")
     end
     -- same as the real-participant loop: every path that skips baseUpdate
     -- still has to advance the presentational clock, and a spectator sits in

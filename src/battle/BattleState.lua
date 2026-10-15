@@ -12,6 +12,7 @@
 
 local Assets = require("src.render.Assets")
 local Catching = require("src.battle.Catching")
+local EndCause = require("src.battle.EndCause")
 local Damage = require("src.battle.Damage")
 local EffectRegistry = require("src.battle.EffectRegistry")
 local Experience = require("src.battle.Experience")
@@ -859,7 +860,7 @@ end
 BattleState.prewarmCries = prewarmCries -- test hook
 
 -- opts.hooked: rod encounter, announced with _HookedMonAttackedText
-function BattleState.newWild(game, species, level, opts)
+function BattleState.newWild(game, species, level, opts, existingMon)
   local self = newBattle(game)
   self.kind = "wild"
   local playerMon = Party.firstHealthy(game.save.party)
@@ -869,7 +870,7 @@ function BattleState.newWild(game, species, level, opts)
   else
     self.player = makeBattler(game.data, playerMon, true, game.save)
   end
-  self.enemy = makeBattler(game.data, Pokemon.new(game.data, species, level), false)
+  self.enemy = makeBattler(game.data, existingMon or Pokemon.new(game.data, species, level), false)
   markSeen(game, species)
   if opts and opts.hooked then
     self.introText = self:romText("_HookedMonAttackedText", "The hooked\n%s\nattacked!", self.enemy.name)
@@ -1941,6 +1942,7 @@ function BattleState:battleKind()
 end
 
 function BattleState:enter()
+  if self._completionPublished then return end
   -- Out of useable POKéMON before the battle even starts.  pokered does not
   -- skip the battle: .checkAnyPartyAlive (engine/battle/core.asm:158-162)
   -- runs right after the intro and jumps to HandlePlayerBlackOut, so the
@@ -1952,13 +1954,17 @@ function BattleState:enter()
   -- constructor flagged the battle dead.
   if self.dead and not self.player then
     local name = self.game.save.player.name
-    self.result = "lose"
+    EndCause.set(self, "lose", "SKIPPED")
+    self._completionPublished = true
     self.game.stack:pop()
     require("src.core.Music").restoreMap(self.data)
-    Runtime.emit("battle.ended", { battle = self, result = "lose", skipped = true })
+    Runtime.emit("battle.ended", { battle = self, result = "lose", endCause = "SKIPPED", skipped = true })
     local onFinish = self.onFinish
+    local completed = false
     local function blackedOut()
-      if onFinish then onFinish("lose") end
+      if completed then return end
+      completed = true
+      if onFinish then onFinish("lose", "SKIPPED") end
     end
     -- the Oak's Lab starter rival returns above PlayerBlackedOutText2 and
     -- afterBattle keeps the player in the lab, so print nothing there
@@ -2543,7 +2549,7 @@ function BattleState:update(dt)
       self:say(romText(self.data, "_OutOfSafariBallsText",
         "PA: Ding-dong!\fYou are out of\nSAFARI BALLs!"))
       self.phase = "messages"
-      self.result = "run"
+      EndCause.set(self, "run", "SAFARI_BALLS_EXHAUSTED")
       self.afterQueue = "finish"
       return
     end
@@ -2844,7 +2850,7 @@ end
 function BattleState:oldManThrow()
   self.phase = "messages"
   self.afterQueue = "finish"
-  self.result = "run" -- nothing is kept; wBattleResult only ends the demo
+  EndCause.set(self, "run", "DEMO_ENDED") -- nothing is kept
   -- engine/items/item_effects.asm:148
   self:sayAuto(self:romText("_ItemUseText001", "%s used\n%s!",
     self.demoName, self.data.items.POKE_BALL.name))
@@ -5193,7 +5199,7 @@ function BattleState:enemyMonFainted()
     end
     self:sayNext(self:romText("_MoneyForWinningText", "%s got ¥%d\nfor winning!", self.game.save.player.name, prize))
   end
-  self.result = "win"
+  EndCause.set(self, "win", self.kind == "trainer" and "TRAINER_DEFEATED" or "POKEMON_KO")
   self.afterQueue = "finish"
 end
 
@@ -5299,7 +5305,7 @@ function BattleState:playerMonFainted()
       self:sayNext(Strings("%s is out of\nuseable POKéMON!", self.game.save.player.name))
       self:sayNext(Strings("%s blacked\nout!", self.game.save.player.name))
     end
-    self.result = "lose"
+    EndCause.set(self, "lose", "PLAYER_DEFEATED")
     self.afterQueue = "finish"
     return
   end
@@ -5318,7 +5324,7 @@ function BattleState:playerMonFainted()
       if self:runRoll(pSpd, TurnOrder.effectiveSpeed(self.enemy)) then
         require("src.core.Sound").play(self.data, "Run")
         self:say(self:romText("_GotAwayText", "Got away safely!"))
-        self.result = "run"
+        EndCause.set(self, "run", "PLAYER_FLED")
         self.playerRan = true
         self.afterQueue = "finish"
       else
@@ -5390,7 +5396,7 @@ function BattleState:safariAction(choice)
   if choice == "run" then
     require("src.core.Sound").play(self.data, "Run")
     self:say(self:romText("_GotAwayText", "Got away safely!"))
-    self.result = "run"
+    EndCause.set(self, "run", "PLAYER_FLED")
     self.playerRan = true
     self.afterQueue = "finish"
     return
@@ -5480,7 +5486,7 @@ function BattleState:safariEnemyTurn()
       end)
       self.nextInsert = (self.nextInsert or 0) + 1
       table.insert(self.queue, self.nextInsert, { wait = 24 })
-      self.result = "run"
+      EndCause.set(self, "run", "SAFARI_POKEMON_FLED")
       self.afterQueue = "finish"
     end
   end)
@@ -5541,7 +5547,7 @@ function BattleState:tryRun()
   if escaped then
     require("src.core.Sound").play(self.data, "Run")
     self:say(self:romText("_GotAwayText", "Got away safely!"))
-    self.result = "run"
+    EndCause.set(self, "run", "PLAYER_FLED")
     self.playerRan = true
     self.afterQueue = "finish"
   else
@@ -5756,13 +5762,16 @@ function BattleState:storeCaughtMon()
   local function askCaughtNickname()
     self:offerNickname(self.enemy.mon, self.enemy.name)
   end
+  self.captureStored = false
   if Party.add(game.save.party, self.enemy.mon) then
+    self.captureStored = true
     askCaughtNickname()
   else
     destination = self:partyFullDestination(self.enemy.mon)
     if destination == "box" then
       local boxNum = require("src.pokemon.Boxes").deposit(game.save, self.enemy.mon)
       if boxNum then
+        self.captureStored = true
         askCaughtNickname()
         -- _ItemUseBallText07/08 keyed on EVENT_MET_BILL
         local metBill = game.save.flags and game.save.flags.EVENT_MET_BILL
@@ -5780,7 +5789,7 @@ function BattleState:storeCaughtMon()
     battle = self, mon = self.enemy.mon, species = species, isNew = isNew,
     ball = self.lastBall, destination = destination, game = game,
   })
-  self.result = "caught"
+  EndCause.set(self, "caught", "CAPTURED")
   self.afterQueue = "finish"
 end
 
@@ -5980,6 +5989,7 @@ function BattleState:playVictoryMusic()
 end
 
 function BattleState:finish()
+  if self._completionPublished then return end
   if self.payDay and self.result == "win" then
     self.game.save.money = self.game.save.money + self.payDay
     self:say(self:romText("_PickUpPayDayMoneyText", "%s picked up\n¥%d!", self.game.save.player.name, self.payDay))
@@ -6018,7 +6028,7 @@ function BattleState:finish()
      and not Party.firstHealthy(self:playerPartyView()) then
     Logger.warn("battle finished %s with no healthy party; forcing blackout",
                 tostring(self.result))
-    self.result = "lose"
+    EndCause.set(self, "lose", "PLAYER_DEFEATED")
   end
   self.lockedBall = nil
   -- pokered never writes Mimic's copy into the party struct; leaving
@@ -6030,15 +6040,22 @@ function BattleState:finish()
   if self.result == "lose" and self.kind ~= "link" and not self.demo
      and not BattleState.isOaksLabStarterRival(self) then
     local game, onFinish, Music = self.game, self.onFinish, require("src.core.Music")
+    local endCause = EndCause.get(self, "lose")
+    local published = false
+    -- The official blackout completes after its fade. Claim completion now
+    -- so recursive finish calls cannot schedule a second transition.
+    self._completionPublished = true
     -- engine/battle/end_of_battle.asm:72
     self.blackoutBlank = true
     -- home/overworld.asm:759
     game.stack:push(require("src.render.Transition").new(game, function()
+      if published then return end
+      published = true
       Music.restoreMap(self.data)
       game.stack:pop()
-      Runtime.emit("battle.ended", { battle = self, result = "lose" })
+      Runtime.emit("battle.ended", { battle = self, result = "lose", endCause = endCause })
       game.blackoutFaded = true
-      if onFinish then onFinish("lose") end
+      if onFinish then onFinish("lose", endCause) end
       game.blackoutFaded = nil
     end, nil, false, { frames = require("src.core.Timing").FADE_OUT_TO_BLACK,
                        framesIn = 0, hold = 110 }))
@@ -6055,30 +6072,40 @@ function BattleState:finish()
   if not (self.result == "win" and self.musicKind == "final") then
     require("src.core.Music").restoreMap(self.data)
   end
+  -- Freeze both public surfaces before listeners run. Preserve the legacy
+  -- missing-result fallback while reporting its unconfirmed provenance.
+  local result = self.result or "run"
+  local endCause = EndCause.get(self, result)
+  local onFinish = self.onFinish
+  local completed = false
+  local function complete()
+    if completed then return end
+    completed = true
+    if onFinish then onFinish(result, endCause) end
+  end
+  self._completionPublished = true
   self.game.stack:pop()
-  Runtime.emit("battle.ended", { battle = self, result = self.result or "run" })
+  Runtime.emit("battle.ended", { battle = self, result = result, endCause = endCause })
   -- Coming back from the battle screen is a fade, not a cut: EnterMap sees
   -- BIT_BATTLE_OVER_OR_BLACKOUT set and runs MapEntryAfterBattle
   -- (home/overworld.asm:22, :749-753) = GBFadeInFromWhite.  This is the one
   -- choke point every battle -- wild, trainer, walk-up, scripted, link --
   -- passes through on its way out, so the fade is guaranteed here rather
   -- than depending on each caller having wrapped onFinish correctly.
-  local result = self.result or "run"
-  local onFinish = self.onFinish
   if result == "lose" then
     -- .battleOccurred skips the faint check in OAKS_LAB and re-enters the map
     -- through MapEntryAfterBattle (home/overworld.asm:343-352) (#1721)
     if BattleState.isOaksLabStarterRival(self) then
       self.game.stack:push(require("src.render.Transition").battleReturn(
-        self.game, function() if onFinish then onFinish(result) end end))
+        self.game, complete))
       return
     end
     -- the blackout path warps to the heal point with its own transition
-    if onFinish then onFinish(result) end
+    complete()
     return
   end
   self.game.stack:push(require("src.render.Transition").battleReturn(self.game,
-    function() if onFinish then onFinish(result) end end))
+    complete))
 end
 
 -- ---------------------------------------------------------------------

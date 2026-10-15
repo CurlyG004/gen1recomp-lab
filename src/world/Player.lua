@@ -5,6 +5,7 @@
 local Collision = require("src.world.Collision")
 local FieldDefaults = require("src.world.FieldDefaults")
 local GameVersion = require("src.core.GameVersion")
+local GroundShadow = require("src.render.GroundShadow")
 local Runtime = require("src.mods.Runtime")
 local SpriteRenderer = require("src.render.SpriteRenderer")
 
@@ -324,6 +325,12 @@ local IMAGE_FACING = { [0] = "down", [1] = "up", [2] = "left", [3] = "right" }
 --
 -- The last return says the player is mid-ledge-hop, which is what the 2D
 -- path draws the ground shadow from and a 3D path turns into vertical lift.
+-- Validate runtime identity lazily, including consumers of pose() outside 2D draw.
+function Player:hasAppearanceOverride()
+  local token = self.appearanceOverride
+  return token ~= nil and token:isActive()
+end
+
 function Player:pose()
   local py = self.py
   local hopping = false
@@ -391,6 +398,8 @@ function Player:pose()
                  or (self.surfing and self.surfingPikachu and self.surfPikachuSprite)
                  or (self.surfing and self.surfSprite)
                  or (self.onBike and self.bikeSprite) or self.sprite
+  -- Resolve native policy first; an owned override only substitutes its renderer.
+  if self:hasAppearanceOverride() then sprite = self.appearanceOverride.sprite end
   return sprite, self.px, py, facing, phase, flip, hopping
 end
 
@@ -411,21 +420,14 @@ function Player:draw(camX, camY)
   --   full-height half-ellipse that already fills the row.  Mirroring
   --   that tile downward stacked a second blob under the first (#408).
   if hopping and self.shadowImg then
-    local yellow = GameVersion.isYellow()
-    local sx = math.floor(self.px - camX)
-    local sy = math.floor(self.py - camY) - 4 + 8 + (yellow and 4 or 0)
-    love.graphics.draw(self.shadowImg, sx, sy)
-    love.graphics.draw(self.shadowImg, sx + 16, sy, 0, -1, 1)
-    if not yellow then
-      love.graphics.draw(self.shadowImg, sx, sy + 16, 0, 1, -1)
-      love.graphics.draw(self.shadowImg, sx + 16, sy + 16, 0, -1, -1)
-    end
+    GroundShadow.draw(self.shadowImg, self.px, self.py, camX, camY)
   end
   -- Fishing pose: the standing frame with its bottom tile row swapped for
   -- RedFishingTiles, which is where the hands and the near half of the rod
   -- live; the far half is the rod OAM OverworldState draws (FishingRodOAM,
   -- engine/overworld/player_animations.asm) -- #384
-  local fishTile = self.fishing and self.fishTiles and self.fishTiles[facing]
+  local fishTile = not self:hasAppearanceOverride()
+    and self.fishing and self.fishTiles and self.fishTiles[facing]
   if fishTile then
     sprite:draw(px, py, camX, camY, facing, 0, false, true)
     -- The fishing pose replaces the bottom 8-pixel tile.  Use the sprite's

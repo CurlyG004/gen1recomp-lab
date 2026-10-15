@@ -360,6 +360,7 @@ function Renderer:beginFrame(transparent)
   self.battleWipe = nil
   -- engine/battle/battle_transitions.asm:28
   self.wipeSprites = nil
+  self.wipeTilt = nil
   self.wipeWox, self.wipeWoy, self.wipeSx, self.wipeSy = nil, nil, nil, nil
   -- whole-surface veil in screen space (battle-transition flash, the
   -- fade in from white after a battle) -- covers the window, not just the
@@ -1167,6 +1168,9 @@ function Renderer:endFrame(zones, worldZones)
     -- projection is unavailable (headless / no shader); then the ground
     -- falls through to the flat blit, keeping the flat frame byte-for-byte
     -- identical to today.
+    -- Both world adapters use this placement for transition survivors.
+    self.wipeWox, self.wipeWoy, self.wipeSx, self.wipeSy = wox, woy, sx, sy
+    self.wipeTilt = self.uprightActive == true
     local projected =
       Tilt.active() and self:drawTiltedWorld(worldZones or zones, sx, sy, wox, woy,
                                              present, vux, vuy, vuw, vuh)
@@ -1177,7 +1181,6 @@ function Renderer:endFrame(zones, worldZones)
         blit(self.worldCanvas, sx, sy, zones, Sx, Sy, wox, woy, vux, vuy, vuw, vuh)
       end
       -- engine/battle/battle_transitions.asm:28
-      self.wipeWox, self.wipeWoy, self.wipeSx, self.wipeSy = wox, woy, sx, sy
       -- OBP-baked overworld sprites replay on top of the zone pass (GBC
       -- mode per-object coloring; see PaletteFX.markSpriteRedraw).  Grass
       -- feet-overdraw entries carry `colors` and re-colorize through the
