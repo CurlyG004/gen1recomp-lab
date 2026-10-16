@@ -132,3 +132,6 @@ src/import/gba/chrome/*.pal
 src/import/gba/chrome/*.rgba
 /os
 /re
+
+
+/mods/PORYGONAL_ECOSYSTEM/
